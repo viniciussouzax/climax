@@ -1,0 +1,16 @@
+# Quickstart self-host. For production behind Traefik/Dokploy, drop `ports`
+# and route a domain to port 8088 instead. See README.
+services:
+  nexus-cli:
+    build: .
+    image: nexus-cli-adapter:latest
+    restart: unless-stopped
+    environment:
+      PORT: "8088"
+      # API key the CRM will send (Authorization: Bearer ...). Required.
+      NEXUS_CLI_API_KEY: ${NEXUS_CLI_API_KEY:?set NEXUS_CLI_API_KEY}
+      # Claude auth (Max OAuth token) — or an API key the claude CLI trusts.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN}
+      NEXUS_CLI_MODEL_ID: nexus-cli
+    ports:
+      - "8088:8088"
