@@ -82,3 +82,7 @@ Clients then use `https://llm.example.com/v1`.
 ## License
 
 MIT
+
+## Deploy
+
+Production runs on Dokploy and **auto-deploys on every push to `main`** (Dokploy builds the image from this repo and redeploys). Live at `https://climax.empreendedor.us/v1` and `https://llm.empreendedor.us/v1`.
