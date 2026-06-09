@@ -1,21 +1,13 @@
 /**
  * Nexus CLI — OpenAI-compatible adapter for the Claude Code CLI.
  *
- * Concurrency model (Cloud Run / Apify style):
- *   - A pool of up to NEXUS_CLI_MAX_CONCURRENCY workers runs `claude -p` in
- *     parallel.
- *   - Requests above that wait in a FIFO queue — nothing is rejected on a burst.
- *     A queued request starts the instant a worker frees up.
- *   - Backpressure: the queue is bounded (NEXUS_CLI_MAX_QUEUE) and each queued
- *     request has a max wait (NEXUS_CLI_QUEUE_TIMEOUT_MS). Only when the queue is
- *     full, or a request waited too long, do we shed load with HTTP 503.
- *   - A client that disconnects while still queued frees its place immediately.
- *
- * The engine (runClaude) is intentionally isolated: swap it for a direct call to
- * the Anthropic HTTP API later and the whole pool/queue keeps working unchanged.
+ * Exposes a minimal OpenAI Chat Completions API that forwards each request to a
+ * fresh, STATELESS `claude -p` invocation. No agents, no persona, no tools, no
+ * memory, no session resume — every call is independent. The only context the
+ * model sees is the `messages` of that single request.
  *
  * Endpoints:
- *   GET  /health                 -> liveness + live pool/queue stats
+ *   GET  /health                 -> liveness
  *   GET  /v1/models              -> [{ id: "nexus-cli" }]
  *   POST /v1/chat/completions    -> OpenAI ChatCompletion (stream + non-stream)
  *
@@ -37,68 +29,9 @@ const API_KEY = process.env.NEXUS_CLI_API_KEY || '';
 const MODEL_ID = process.env.NEXUS_CLI_MODEL_ID || 'nexus-cli';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const TIMEOUT_MS = parseInt(process.env.NEXUS_CLI_TIMEOUT_MS || '180000', 10);
-const MAX_CONCURRENCY = parseInt(process.env.NEXUS_CLI_MAX_CONCURRENCY || '12', 10);
-const MAX_QUEUE = parseInt(process.env.NEXUS_CLI_MAX_QUEUE || '200', 10);
-const QUEUE_TIMEOUT_MS = parseInt(process.env.NEXUS_CLI_QUEUE_TIMEOUT_MS || '90000', 10);
+const MAX_CONCURRENCY = parseInt(process.env.NEXUS_CLI_MAX_CONCURRENCY || '4', 10);
 
-// ---- concurrency pool + FIFO queue -----------------------------------------
-
-let active = 0;       // workers currently running a claude process
-let served = 0;       // total requests that acquired a worker (lifetime)
-let shed = 0;         // total requests rejected by backpressure (lifetime)
-const waiters = [];   // FIFO queue of pending slot acquisitions
-
-// Acquire a worker slot. Returns { promise, cancel }.
-//   promise resolves when a slot is free (immediately, or after queueing),
-//   and rejects with code QUEUE_FULL / QUEUE_TIMEOUT / CANCELED.
-//   cancel() removes the request from the queue if it is still waiting.
-function acquireSlot() {
-  const handle = { waiter: null, cancel: () => {} };
-  handle.promise = new Promise((resolve, reject) => {
-    if (active < MAX_CONCURRENCY) {
-      active++;
-      return resolve();
-    }
-    if (waiters.length >= MAX_QUEUE) {
-      const e = new Error('queue full');
-      e.code = 'QUEUE_FULL';
-      return reject(e);
-    }
-    const waiter = { resolve, reject };
-    waiter.timer = setTimeout(() => {
-      const i = waiters.indexOf(waiter);
-      if (i !== -1) waiters.splice(i, 1);
-      const e = new Error('queued longer than ' + QUEUE_TIMEOUT_MS + 'ms');
-      e.code = 'QUEUE_TIMEOUT';
-      reject(e);
-    }, QUEUE_TIMEOUT_MS);
-    waiter.cancel = () => {
-      const i = waiters.indexOf(waiter);
-      if (i !== -1) {
-        waiters.splice(i, 1);
-        clearTimeout(waiter.timer);
-        const e = new Error('client closed connection');
-        e.code = 'CANCELED';
-        reject(e);
-      }
-    };
-    waiters.push(waiter);
-    handle.waiter = waiter;
-  });
-  handle.cancel = () => { if (handle.waiter) handle.waiter.cancel(); };
-  return handle;
-}
-
-// Release a worker slot: hand it to the next queued request, or free it.
-function releaseSlot() {
-  const next = waiters.shift();
-  if (next) {
-    clearTimeout(next.timer);
-    next.resolve(); // slot handed off — `active` stays the same
-  } else {
-    active--;
-  }
-}
+let inFlight = 0;
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -210,23 +143,10 @@ async function handleChat(req, res, body) {
     return oaiError(res, 400, '`messages` is required');
   }
 
-  // Acquire a worker slot. Under load this waits in the FIFO queue instead of
-  // rejecting. A client disconnect while queued frees the slot immediately.
-  const slot = acquireSlot();
-  const onClose = () => slot.cancel();
-  res.on('close', onClose);
-  try {
-    await slot.promise;
-  } catch (e) {
-    res.removeListener('close', onClose);
-    shed++;
-    if (e.code === 'QUEUE_FULL') return oaiError(res, 503, 'server at capacity (queue full) — retry shortly', 'overloaded_error');
-    if (e.code === 'QUEUE_TIMEOUT') return oaiError(res, 503, 'request timed out waiting in queue', 'overloaded_error');
-    if (e.code === 'CANCELED') { try { res.end(); } catch (_) {} return; }
-    return oaiError(res, 503, 'unavailable', 'overloaded_error');
+  if (inFlight >= MAX_CONCURRENCY) {
+    return oaiError(res, 429, 'too many concurrent requests', 'rate_limit_error');
   }
-  res.removeListener('close', onClose);
-  served++;
+  inFlight++;
 
   const { system, prompt } = buildPrompt(messages);
   const id = 'chatcmpl-' + crypto.randomUUID();
@@ -260,7 +180,7 @@ async function handleChat(req, res, body) {
     if (stream && res.headersSent) { try { res.end(); } catch (_) {} }
     else oaiError(res, 502, String(e.message || e), 'api_error');
   } finally {
-    releaseSlot();
+    inFlight--;
   }
 }
 
@@ -269,17 +189,7 @@ async function handleChat(req, res, body) {
 const server = http.createServer((req, res) => {
   const url = (req.url || '').split('?')[0];
 
-  if (req.method === 'GET' && url === '/health') {
-    return send(res, 200, {
-      status: 'ok',
-      active,
-      queued: waiters.length,
-      max_concurrency: MAX_CONCURRENCY,
-      max_queue: MAX_QUEUE,
-      served,
-      shed,
-    });
-  }
+  if (req.method === 'GET' && url === '/health') return send(res, 200, { status: 'ok' });
   if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
     if (!authOk(req)) return oaiError(res, 401, 'invalid api key', 'authentication_error');
     return handleModels(res);
@@ -295,9 +205,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    `[nexus-cli] listening on :${PORT} ` +
-    `(model=${MODEL_ID}, auth=${API_KEY ? 'on' : 'off'}, ` +
-    `concurrency=${MAX_CONCURRENCY}, max_queue=${MAX_QUEUE}, queue_timeout=${QUEUE_TIMEOUT_MS}ms)`
-  );
+  console.log(`[nexus-cli] listening on :${PORT} (model=${MODEL_ID}, auth=${API_KEY ? 'on' : 'off'})`);
 });
