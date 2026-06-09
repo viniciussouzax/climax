@@ -1,4 +1,4 @@
-# Nexus CLI — OpenAI-compatible adapter for the Claude Code CLI.
+# CLI MAX — OpenAI-compatible adapter for the Claude Code CLI.
 # Small, single-runtime image: Node + the official `claude` CLI. No app deps.
 FROM node:22-slim
 

@@ -1,13 +1,13 @@
 /**
- * Nexus CLI — OpenAI-compatible adapter for the Claude Code CLI.
+ * CLI MAX — OpenAI-compatible adapter for the Claude Code CLI.
  *
  * Concurrency model (Cloud Run / Apify style):
- *   - A pool of up to NEXUS_CLI_MAX_CONCURRENCY workers runs `claude -p` in
+ *   - A pool of up to CLIMAX_MAX_CONCURRENCY workers runs `claude -p` in
  *     parallel.
  *   - Every request above that WAITS in an unbounded FIFO queue. Nothing is ever
  *     rejected, expired, or dropped: a queued request starts the instant a worker
  *     frees up, and every request that enters is eventually resolved.
- *   - The only per-run safety is NEXUS_CLI_TIMEOUT_MS: if a single `claude`
+ *   - The only per-run safety is CLIMAX_TIMEOUT_MS: if a single `claude`
  *     process freezes, it is killed so its worker slot is returned to the pool
  *     (otherwise one wedged run would stall everyone behind it). That request
  *     gets a normal error response; it is not silently discarded.
@@ -17,11 +17,11 @@
  *
  * Endpoints:
  *   GET  /health                 -> liveness + live pool/queue stats
- *   GET  /v1/models              -> [{ id: "nexus-cli" }]
+ *   GET  /v1/models              -> [{ id: "climax" }]
  *   POST /v1/chat/completions    -> OpenAI ChatCompletion (stream + non-stream)
  *
- * Auth: if NEXUS_CLI_API_KEY is set, requests must send
- *   Authorization: Bearer <NEXUS_CLI_API_KEY>
+ * Auth: if CLIMAX_API_KEY is set, requests must send
+ *   Authorization: Bearer <CLIMAX_API_KEY>
  *
  * Engine: the `claude` CLI authenticated via CLAUDE_CODE_OAUTH_TOKEN (or an
  * Anthropic API key the CLI already trusts). The requested `model` field is
@@ -34,11 +34,11 @@ const { spawn } = require('child_process');
 const crypto = require('crypto');
 
 const PORT = parseInt(process.env.PORT || '8088', 10);
-const API_KEY = process.env.NEXUS_CLI_API_KEY || '';
-const MODEL_ID = process.env.NEXUS_CLI_MODEL_ID || 'nexus-cli';
+const API_KEY = process.env.CLIMAX_API_KEY || '';
+const MODEL_ID = process.env.CLIMAX_MODEL_ID || 'climax';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
-const TIMEOUT_MS = parseInt(process.env.NEXUS_CLI_TIMEOUT_MS || '180000', 10);
-const MAX_CONCURRENCY = parseInt(process.env.NEXUS_CLI_MAX_CONCURRENCY || '12', 10);
+const TIMEOUT_MS = parseInt(process.env.CLIMAX_TIMEOUT_MS || '180000', 10);
+const MAX_CONCURRENCY = parseInt(process.env.CLIMAX_MAX_CONCURRENCY || '12', 10);
 
 // ---- concurrency pool + unbounded FIFO queue -------------------------------
 
@@ -171,7 +171,7 @@ function runClaude(system, prompt) {
 function handleModels(res) {
   send(res, 200, {
     object: 'list',
-    data: [{ id: MODEL_ID, object: 'model', created: 0, owned_by: 'nexus-cli' }],
+    data: [{ id: MODEL_ID, object: 'model', created: 0, owned_by: 'climax' }],
   });
 }
 
@@ -254,7 +254,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(
-    `[nexus-cli] listening on :${PORT} ` +
+    `[climax] listening on :${PORT} ` +
     `(model=${MODEL_ID}, auth=${API_KEY ? 'on' : 'off'}, ` +
     `concurrency=${MAX_CONCURRENCY}, queue=unbounded)`
   );
