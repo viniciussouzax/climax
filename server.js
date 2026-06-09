@@ -4,12 +4,13 @@
  * Concurrency model (Cloud Run / Apify style):
  *   - A pool of up to NEXUS_CLI_MAX_CONCURRENCY workers runs `claude -p` in
  *     parallel.
- *   - Requests above that wait in a FIFO queue — nothing is rejected on a burst.
- *     A queued request starts the instant a worker frees up.
- *   - Backpressure: the queue is bounded (NEXUS_CLI_MAX_QUEUE) and each queued
- *     request has a max wait (NEXUS_CLI_QUEUE_TIMEOUT_MS). Only when the queue is
- *     full, or a request waited too long, do we shed load with HTTP 503.
- *   - A client that disconnects while still queued frees its place immediately.
+ *   - Every request above that WAITS in an unbounded FIFO queue. Nothing is ever
+ *     rejected, expired, or dropped: a queued request starts the instant a worker
+ *     frees up, and every request that enters is eventually resolved.
+ *   - The only per-run safety is NEXUS_CLI_TIMEOUT_MS: if a single `claude`
+ *     process freezes, it is killed so its worker slot is returned to the pool
+ *     (otherwise one wedged run would stall everyone behind it). That request
+ *     gets a normal error response; it is not silently discarded.
  *
  * The engine (runClaude) is intentionally isolated: swap it for a direct call to
  * the Anthropic HTTP API later and the whole pool/queue keeps working unchanged.
@@ -38,63 +39,33 @@ const MODEL_ID = process.env.NEXUS_CLI_MODEL_ID || 'nexus-cli';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const TIMEOUT_MS = parseInt(process.env.NEXUS_CLI_TIMEOUT_MS || '180000', 10);
 const MAX_CONCURRENCY = parseInt(process.env.NEXUS_CLI_MAX_CONCURRENCY || '12', 10);
-const MAX_QUEUE = parseInt(process.env.NEXUS_CLI_MAX_QUEUE || '200', 10);
-const QUEUE_TIMEOUT_MS = parseInt(process.env.NEXUS_CLI_QUEUE_TIMEOUT_MS || '90000', 10);
 
-// ---- concurrency pool + FIFO queue -----------------------------------------
+// ---- concurrency pool + unbounded FIFO queue -------------------------------
 
 let active = 0;       // workers currently running a claude process
 let served = 0;       // total requests that acquired a worker (lifetime)
-let shed = 0;         // total requests rejected by backpressure (lifetime)
-const waiters = [];   // FIFO queue of pending slot acquisitions
+let peakQueue = 0;    // high-water mark of the queue depth (lifetime)
+const waiters = [];   // FIFO queue of pending slot acquisitions (unbounded)
 
-// Acquire a worker slot. Returns { promise, cancel }.
-//   promise resolves when a slot is free (immediately, or after queueing),
-//   and rejects with code QUEUE_FULL / QUEUE_TIMEOUT / CANCELED.
-//   cancel() removes the request from the queue if it is still waiting.
+// Acquire a worker slot. Resolves immediately if a slot is free, otherwise waits
+// in the FIFO queue until one frees up. It NEVER rejects, expires, or drops the
+// request — every caller is eventually granted a slot.
 function acquireSlot() {
-  const handle = { waiter: null, cancel: () => {} };
-  handle.promise = new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     if (active < MAX_CONCURRENCY) {
       active++;
       return resolve();
     }
-    if (waiters.length >= MAX_QUEUE) {
-      const e = new Error('queue full');
-      e.code = 'QUEUE_FULL';
-      return reject(e);
-    }
-    const waiter = { resolve, reject };
-    waiter.timer = setTimeout(() => {
-      const i = waiters.indexOf(waiter);
-      if (i !== -1) waiters.splice(i, 1);
-      const e = new Error('queued longer than ' + QUEUE_TIMEOUT_MS + 'ms');
-      e.code = 'QUEUE_TIMEOUT';
-      reject(e);
-    }, QUEUE_TIMEOUT_MS);
-    waiter.cancel = () => {
-      const i = waiters.indexOf(waiter);
-      if (i !== -1) {
-        waiters.splice(i, 1);
-        clearTimeout(waiter.timer);
-        const e = new Error('client closed connection');
-        e.code = 'CANCELED';
-        reject(e);
-      }
-    };
-    waiters.push(waiter);
-    handle.waiter = waiter;
+    waiters.push(resolve);
+    if (waiters.length > peakQueue) peakQueue = waiters.length;
   });
-  handle.cancel = () => { if (handle.waiter) handle.waiter.cancel(); };
-  return handle;
 }
 
 // Release a worker slot: hand it to the next queued request, or free it.
 function releaseSlot() {
   const next = waiters.shift();
   if (next) {
-    clearTimeout(next.timer);
-    next.resolve(); // slot handed off — `active` stays the same
+    next(); // slot handed off to the next in line — `active` stays the same
   } else {
     active--;
   }
@@ -163,6 +134,8 @@ function runClaude(system, prompt) {
 
     let out = '';
     let err = '';
+    // Per-run anti-freeze: only fires if a single claude process wedges, so its
+    // worker slot returns to the pool instead of stalling the whole queue.
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch (_) {}
       reject(new Error(`claude timed out after ${TIMEOUT_MS}ms`));
@@ -210,22 +183,8 @@ async function handleChat(req, res, body) {
     return oaiError(res, 400, '`messages` is required');
   }
 
-  // Acquire a worker slot. Under load this waits in the FIFO queue instead of
-  // rejecting. A client disconnect while queued frees the slot immediately.
-  const slot = acquireSlot();
-  const onClose = () => slot.cancel();
-  res.on('close', onClose);
-  try {
-    await slot.promise;
-  } catch (e) {
-    res.removeListener('close', onClose);
-    shed++;
-    if (e.code === 'QUEUE_FULL') return oaiError(res, 503, 'server at capacity (queue full) — retry shortly', 'overloaded_error');
-    if (e.code === 'QUEUE_TIMEOUT') return oaiError(res, 503, 'request timed out waiting in queue', 'overloaded_error');
-    if (e.code === 'CANCELED') { try { res.end(); } catch (_) {} return; }
-    return oaiError(res, 503, 'unavailable', 'overloaded_error');
-  }
-  res.removeListener('close', onClose);
+  // Wait in the FIFO queue for a free worker. Always resolves — never rejected.
+  await acquireSlot();
   served++;
 
   const { system, prompt } = buildPrompt(messages);
@@ -275,9 +234,8 @@ const server = http.createServer((req, res) => {
       active,
       queued: waiters.length,
       max_concurrency: MAX_CONCURRENCY,
-      max_queue: MAX_QUEUE,
       served,
-      shed,
+      peak_queue: peakQueue,
     });
   }
   if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
@@ -298,6 +256,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(
     `[nexus-cli] listening on :${PORT} ` +
     `(model=${MODEL_ID}, auth=${API_KEY ? 'on' : 'off'}, ` +
-    `concurrency=${MAX_CONCURRENCY}, max_queue=${MAX_QUEUE}, queue_timeout=${QUEUE_TIMEOUT_MS}ms)`
+    `concurrency=${MAX_CONCURRENCY}, queue=unbounded)`
   );
 });
