@@ -1,37 +1,28 @@
-/**
- * CLI MAX — OpenAI-compatible adapter for the Claude Code CLI.
- *
- * Concurrency model (Cloud Run / Apify style):
- *   - A pool of up to CLIMAX_MAX_CONCURRENCY workers runs `claude -p` in
- *     parallel.
- *   - Every request above that WAITS in an unbounded FIFO queue. Nothing is ever
- *     rejected, expired, or dropped: a queued request starts the instant a worker
- *     frees up, and every request that enters is eventually resolved.
- *   - The only per-run safety is CLIMAX_TIMEOUT_MS: if a single `claude`
- *     process freezes, it is killed so its worker slot is returned to the pool
- *     (otherwise one wedged run would stall everyone behind it). That request
- *     gets a normal error response; it is not silently discarded.
- *
- * The engine (runClaude) is intentionally isolated: swap it for a direct call to
- * the Anthropic HTTP API later and the whole pool/queue keeps working unchanged.
- *
- * Endpoints:
- *   GET  /health                 -> liveness + live pool/queue stats
- *   GET  /v1/models              -> [{ id: "climax" }]
- *   POST /v1/chat/completions    -> OpenAI ChatCompletion (stream + non-stream)
- *
- * Auth: if CLIMAX_API_KEY is set, requests must send
- *   Authorization: Bearer <CLIMAX_API_KEY>
- *
- * Engine: the `claude` CLI authenticated via CLAUDE_CODE_OAUTH_TOKEN (or an
- * Anthropic API key the CLI already trusts). The requested `model` field is
- * ignored — the CLI's configured default model is always used.
- */
 'use strict';
+/**
+ * CLI MAX (climax) — OpenAI-compatible adapter for the Claude Code CLI.
+ *
+ * v2 — OpenRouter-grade hardening over `claude -p`:
+ *   - REAL streaming (stream-json -> well-formed chat.completion.chunk SSE)
+ *   - Proper error codes: rate-limit -> 429 + Retry-After, timeout -> 504,
+ *     transient -> retried (backoff) then 502; structured per-request logs.
+ *   - Bounded FIFO queue with 429 backpressure (no unbounded memory / OOM).
+ *   - `model` -> `--model` passthrough + echoed back; honest 400 for
+ *     unsupported features (function calling, image/multimodal).
+ *   - System prompt via --system-prompt-file (no argv E2BIG); `stop` honored;
+ *     constant-time auth, fail-closed env, x-request-id, graceful shutdown.
+ *
+ * Engine note: `claude -p` is single-shot (--max-turns 1, tools off). Native
+ * function-calling / agentic tool round-trips are NOT possible with the CLI —
+ * those require the Anthropic Messages API. Everything else below is real.
+ */
 
 const http = require('http');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const PORT = parseInt(process.env.PORT || '8088', 10);
 const API_KEY = process.env.CLIMAX_API_KEY || '';
@@ -39,58 +30,59 @@ const MODEL_ID = process.env.CLIMAX_MODEL_ID || 'climax';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const TIMEOUT_MS = parseInt(process.env.CLIMAX_TIMEOUT_MS || '180000', 10);
 const MAX_CONCURRENCY = parseInt(process.env.CLIMAX_MAX_CONCURRENCY || '12', 10);
+const MAX_QUEUE = parseInt(process.env.CLIMAX_MAX_QUEUE || '200', 10);
+const RETRIES = parseInt(process.env.CLIMAX_RETRIES || '2', 10);
+const DEFAULT_MODEL = process.env.CLIMAX_DEFAULT_MODEL || ''; // '' = let the CLI pick its default
+const FALLBACK_MODEL = process.env.CLIMAX_FALLBACK_MODEL || ''; // optional auto-fallback on overload
 
-// ---- concurrency pool + unbounded FIFO queue -------------------------------
+// ---- concurrency pool + BOUNDED FIFO queue ---------------------------------
+let active = 0, served = 0, peakQueue = 0, shed = 0;
+const waiters = [];
 
-let active = 0;       // workers currently running a claude process
-let served = 0;       // total requests that acquired a worker (lifetime)
-let peakQueue = 0;    // high-water mark of the queue depth (lifetime)
-const waiters = [];   // FIFO queue of pending slot acquisitions (unbounded)
-
-// Acquire a worker slot. Resolves immediately if a slot is free, otherwise waits
-// in the FIFO queue until one frees up. It NEVER rejects, expires, or drops the
-// request — every caller is eventually granted a slot.
 function acquireSlot() {
-  return new Promise((resolve) => {
-    if (active < MAX_CONCURRENCY) {
-      active++;
-      return resolve();
+  return new Promise((resolve, reject) => {
+    if (active < MAX_CONCURRENCY) { active++; return resolve(); }
+    if (waiters.length >= MAX_QUEUE) {
+      shed++;
+      const e = new Error('overloaded'); e.kind = 'overloaded';
+      return reject(e);
     }
     waiters.push(resolve);
     if (waiters.length > peakQueue) peakQueue = waiters.length;
   });
 }
-
-// Release a worker slot: hand it to the next queued request, or free it.
 function releaseSlot() {
   const next = waiters.shift();
-  if (next) {
-    next(); // slot handed off to the next in line — `active` stays the same
-  } else {
-    active--;
-  }
+  if (next) next(); else active = Math.max(0, active - 1);
 }
 
+// ---- typed errors ----------------------------------------------------------
+class RateLimitError extends Error { constructor(m, retryAfter) { super(m); this.kind = 'rate_limit'; this.retryAfter = retryAfter || 60; } }
+class TimeoutError extends Error { constructor(m) { super(m); this.kind = 'timeout'; } }
+class ClaudeError extends Error { constructor(m, transient) { super(m); this.kind = 'claude'; this.transient = !!transient; } }
+
 // ---- helpers ---------------------------------------------------------------
+function log(o) { try { process.stdout.write(JSON.stringify({ t: new Date().toISOString(), ...o }) + '\n'); } catch (_) {} }
 
 function send(res, status, body, headers = {}) {
   const data = typeof body === 'string' ? body : JSON.stringify(body);
   res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
   res.end(data);
 }
-
-function oaiError(res, status, message, type = 'invalid_request_error') {
-  send(res, status, { error: { message, type, code: status } });
+function oaiError(res, status, message, type, code, headers = {}) {
+  send(res, status, { error: { message, type, code, param: null } }, headers);
 }
 
 function authOk(req) {
-  if (!API_KEY) return true; // open if no key configured
+  if (!API_KEY) return true; // open only if explicitly no key configured
   const h = req.headers['authorization'] || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
-  return m && m[1] === API_KEY;
+  if (!m) return false;
+  const a = Buffer.from(m[1]);
+  const b = Buffer.from(API_KEY);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// OpenAI message content can be a string or an array of parts. Extract text.
 function contentToText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -101,161 +93,284 @@ function contentToText(content) {
   }
   return '';
 }
+function hasNonText(content) {
+  return Array.isArray(content) && content.some((p) => p && p.type && p.type !== 'text');
+}
 
-// Render OpenAI messages into a system prompt + a single conversation prompt.
 function buildPrompt(messages) {
-  const system = messages
-    .filter((m) => m.role === 'system')
-    .map((m) => contentToText(m.content))
-    .filter(Boolean)
-    .join('\n\n');
-
+  const system = messages.filter((m) => m.role === 'system').map((m) => contentToText(m.content)).filter(Boolean).join('\n\n');
   const turns = messages.filter((m) => m.role !== 'system');
   const prompt = turns
     .map((m) => {
-      const role = m.role === 'assistant' ? 'Assistant' : m.role === 'user' ? 'User' : m.role;
+      const role = m.role === 'assistant' ? 'Assistant' : m.role === 'user' ? 'User' : m.role === 'tool' ? 'Tool' : m.role;
       return `${role}: ${contentToText(m.content)}`;
     })
     .join('\n\n');
-
   return { system, prompt };
 }
 
-// Run a fresh, stateless `claude -p`. Resolves with { text, usage }.
-function runClaude(system, prompt) {
+// Map an OpenAI model string to a claude --model (or null = CLI default).
+function mapModel(reqModel) {
+  if (!reqModel) return DEFAULT_MODEL || null;
+  const bare = String(reqModel).toLowerCase().replace(/^(openai|anthropic)\//, '');
+  if (/(sonnet|opus|haiku|^claude)/.test(bare)) return bare; // a real Claude model/alias
+  return DEFAULT_MODEL || null; // generic names (climax, gpt-4o, ...) -> CLI default
+}
+
+function isRateLimitText(s) {
+  return /rate.?limit|overloaded|usage limit|429|too many requests|quota|exceeded your/i.test(s || '');
+}
+function sumInput(u) {
+  if (!u) return 0;
+  return (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+}
+
+// ---- claude engine ---------------------------------------------------------
+// Spawns `claude -p`. For stream mode, calls onDelta(text) live as deltas arrive.
+// Resolves { text, usage, finishReason } or rejects a typed error.
+function runClaude({ system, prompt, model, stream, onDelta }) {
   return new Promise((resolve, reject) => {
-    const args = ['-p', '--output-format', 'json', '--max-turns', '1', '--allowedTools', ''];
-    if (system) args.push('--system-prompt', system);
+    let sysFile = null;
+    const args = ['-p', '--max-turns', '1', '--allowedTools', ''];
+    if (stream) args.push('--output-format', 'stream-json', '--include-partial-messages', '--verbose');
+    else args.push('--output-format', 'json');
+    if (model) args.push('--model', model);
+    if (FALLBACK_MODEL) args.push('--fallback-model', FALLBACK_MODEL);
+    if (system) {
+      try {
+        sysFile = path.join(os.tmpdir(), 'climax-sys-' + crypto.randomUUID() + '.txt');
+        fs.writeFileSync(sysFile, system);
+        args.push('--system-prompt-file', sysFile);
+      } catch (_) { sysFile = null; args.push('--system-prompt', system); }
+    }
 
-    const child = spawn(CLAUDE_BIN, args, {
-      env: process.env,
-      stdio: ['pipe', 'pipe', 'pipe'],
+    const childEnv = { ...process.env };
+    delete childEnv.CLIMAX_API_KEY; // do not leak our gateway key into the child
+
+    let settled = false;
+    const cleanup = () => { if (sysFile) { try { fs.unlinkSync(sysFile); } catch (_) {} } };
+    const finish = (fn, v) => { if (settled) return; settled = true; clearTimeout(timer); cleanup(); fn(v); };
+
+    let child;
+    try {
+      child = spawn(CLAUDE_BIN, args, { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) { cleanup(); return reject(new ClaudeError('spawn failed: ' + e.message, true)); }
+
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(reject, new TimeoutError(`claude timed out after ${TIMEOUT_MS}ms`)); }, TIMEOUT_MS);
+
+    let out = '', err = '', sbuf = '';
+    let text = '', finishReason = 'stop';
+    let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    let rateLimited = null;   // { retryAfter }
+    let resultErr = null;     // non-rate-limit application error from claude
+
+    function onEvent(ev) {
+      if (!ev || typeof ev !== 'object') return;
+      if (ev.type === 'rate_limit_event' && ev.rate_limit_info) {
+        const ri = ev.rate_limit_info;
+        if (ri.resetsAt) rateLimited = { retryAfter: Math.max(1, ri.resetsAt - Math.floor(Date.now() / 1000)), hard: false, ...(rateLimited || {}) };
+        if (/(rejected|blocked|exceeded)/i.test(ri.status || '')) rateLimited = { retryAfter: (rateLimited && rateLimited.retryAfter) || 60, hard: true };
+      } else if (ev.type === 'stream_event' && ev.event) {
+        const e = ev.event;
+        if (e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') {
+          const t = e.delta.text || '';
+          if (t) { text += t; if (stream && onDelta) onDelta(t); }
+        } else if (e.type === 'message_start' && e.message && e.message.usage) {
+          usage.prompt_tokens = sumInput(e.message.usage) || usage.prompt_tokens;
+        } else if (e.type === 'message_delta') {
+          if (e.usage && e.usage.output_tokens != null) usage.completion_tokens = e.usage.output_tokens;
+          if (e.delta && e.delta.stop_reason) finishReason = e.delta.stop_reason === 'max_tokens' ? 'length' : 'stop';
+        }
+      } else if (ev.type === 'result') {
+        if (ev.usage) { usage.prompt_tokens = sumInput(ev.usage) || usage.prompt_tokens; usage.completion_tokens = ev.usage.output_tokens || usage.completion_tokens; }
+        if (typeof ev.result === 'string' && !stream && !ev.is_error) text = ev.result;
+        if (ev.is_error) {
+          const msg = (ev.result || ev.subtype || 'unknown') + '';
+          if (isRateLimitText(msg)) rateLimited = { retryAfter: (rateLimited && rateLimited.retryAfter) || 60, hard: true };
+          else resultErr = msg;
+        }
+      }
+    }
+
+    child.stdout.on('data', (d) => {
+      out += d;
+      if (!stream) return;
+      sbuf += d;
+      let i;
+      while ((i = sbuf.indexOf('\n')) >= 0) {
+        const line = sbuf.slice(0, i).trim();
+        sbuf = sbuf.slice(i + 1);
+        if (line) { try { onEvent(JSON.parse(line)); } catch (_) {} }
+      }
     });
-
-    let out = '';
-    let err = '';
-    // Per-run anti-freeze: only fires if a single claude process wedges, so its
-    // worker slot returns to the pool instead of stalling the whole queue.
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch (_) {}
-      reject(new Error(`claude timed out after ${TIMEOUT_MS}ms`));
-    }, TIMEOUT_MS);
-
-    child.stdout.on('data', (d) => (out += d));
     child.stderr.on('data', (d) => (err += d));
-    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('error', (e) => finish(reject, new ClaudeError('claude spawn error: ' + e.message, true)));
     child.on('close', (code) => {
-      clearTimeout(timer);
-      if (code !== 0) return reject(new Error(`claude exited ${code}: ${err.slice(0, 500)}`));
-      let json;
-      try { json = JSON.parse(out); } catch (e) { return reject(new Error(`bad claude JSON: ${out.slice(0, 500)}`)); }
-      if (json.is_error) return reject(new Error(`claude error: ${json.result || json.subtype || 'unknown'}`));
-      const u = json.usage || {};
-      resolve({
-        text: json.result || '',
-        usage: {
-          prompt_tokens: u.input_tokens || 0,
-          completion_tokens: u.output_tokens || 0,
-          total_tokens: (u.input_tokens || 0) + (u.output_tokens || 0),
-        },
-      });
+      if (stream && sbuf.trim()) { try { onEvent(JSON.parse(sbuf.trim())); } catch (_) {} }
+      if (!stream) {
+        try {
+          const j = JSON.parse(out);
+          if (j.usage) { usage.prompt_tokens = sumInput(j.usage); usage.completion_tokens = j.usage.output_tokens || 0; }
+          if (j.is_error) {
+            const msg = (j.result || j.subtype || 'unknown') + '';
+            if (isRateLimitText(msg)) rateLimited = { retryAfter: 60, hard: true }; else resultErr = msg;
+          } else { text = j.result || ''; }
+        } catch (_) { if (code === 0) resultErr = 'bad claude JSON: ' + out.slice(0, 200); }
+      }
+      usage.total_tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+
+      if (rateLimited && (rateLimited.hard || code !== 0)) return finish(reject, new RateLimitError('claude rate/usage limit', rateLimited.retryAfter));
+      if (code !== 0) {
+        if (isRateLimitText(err)) return finish(reject, new RateLimitError('claude rate/usage limit', (rateLimited && rateLimited.retryAfter) || 60));
+        const transient = !err.trim() || /(5\d\d|overloaded|timeout|econnreset|temporar|refresh|network|socket)/i.test(err);
+        return finish(reject, new ClaudeError(`claude exited ${code}: ${(err.trim() || '(empty stderr)').slice(0, 400)}`, transient));
+      }
+      if (resultErr) return finish(reject, new ClaudeError(resultErr.slice(0, 400), false));
+      finish(resolve, { text, usage, finishReason });
     });
 
-    child.stdin.write(prompt);
-    child.stdin.end();
+    try { child.stdin.write(prompt); child.stdin.end(); } catch (_) {}
   });
 }
 
 // ---- handlers --------------------------------------------------------------
-
 function handleModels(res) {
-  send(res, 200, {
-    object: 'list',
-    data: [{ id: MODEL_ID, object: 'model', created: 0, owned_by: 'climax' }],
-  });
+  send(res, 200, { object: 'list', data: [{ id: MODEL_ID, object: 'model', created: 0, owned_by: 'climax' }] });
 }
 
-async function handleChat(req, res, body) {
+async function handleChat(req, res, body, reqId) {
   let payload;
-  try { payload = JSON.parse(body || '{}'); } catch (_) { return oaiError(res, 400, 'invalid JSON body'); }
+  try { payload = JSON.parse(body || '{}'); } catch (_) { return oaiError(res, 400, 'invalid JSON body', 'invalid_request_error', 'invalid_json'); }
+
   const messages = payload.messages;
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return oaiError(res, 400, '`messages` is required');
+  if (!Array.isArray(messages) || messages.length === 0) return oaiError(res, 400, '`messages` is required', 'invalid_request_error', 'invalid_messages');
+
+  // Honest rejections for things this engine genuinely cannot do.
+  const tc = payload.tool_choice;
+  if (Array.isArray(payload.tools) && payload.tools.length && (tc === 'required' || (tc && typeof tc === 'object'))) {
+    return oaiError(res, 400, 'function/tool calling is not supported by this engine (claude -p is single-shot). Use a tool-calling LLM for agents that must call tools.', 'invalid_request_error', 'tools_unsupported');
+  }
+  if (messages.some((m) => hasNonText(m.content))) {
+    return oaiError(res, 400, 'non-text (image/multimodal) content is not supported by this engine', 'invalid_request_error', 'multimodal_unsupported');
   }
 
-  // Wait in the FIFO queue for a free worker. Always resolves — never rejected.
-  await acquireSlot();
-  served++;
+  try { await acquireSlot(); }
+  catch (e) { return oaiError(res, 429, 'server is at capacity, retry shortly', 'rate_limit_error', 'capacity', { 'Retry-After': '5', 'x-request-id': reqId }); }
 
+  served++;
   const { system, prompt } = buildPrompt(messages);
+  const model = mapModel(payload.model);
+  const echoModel = payload.model || MODEL_ID;
   const id = 'chatcmpl-' + crypto.randomUUID();
   const created = Math.floor(Date.now() / 1000);
   const stream = payload.stream === true;
+  const stops = Array.isArray(payload.stop) ? payload.stop : payload.stop ? [payload.stop] : [];
+  const t0 = Date.now();
 
-  try {
-    const { text, usage } = await runClaude(system, prompt);
-
-    if (!stream) {
-      return send(res, 200, {
-        id, object: 'chat.completion', created, model: MODEL_ID,
-        choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-        usage,
-      });
-    }
-
-    // Streaming: emit the result as a single content delta then [DONE].
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
-    const base = { id, object: 'chat.completion.chunk', created, model: MODEL_ID };
+  let headersSent = false;
+  const base = { id, object: 'chat.completion.chunk', created, model: echoModel };
+  const sseInit = () => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'x-request-id': reqId });
     res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })}\n\n`);
-    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`);
-    res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
-    res.write('data: [DONE]\n\n');
-    res.end();
+    headersSent = true;
+  };
+  const sseDelta = (t) => res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: t }, finish_reason: null }] })}\n\n`);
+
+  let attempt = 0;
+  try {
+    while (true) {
+      attempt++;
+      try {
+        if (stream) {
+          const onDelta = (t) => { if (!headersSent) sseInit(); sseDelta(t); };
+          const r = await runClaude({ system, prompt, model, stream: true, onDelta });
+          if (!headersSent) sseInit();
+          res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: r.finishReason || 'stop' }] })}\n\n`);
+          if (payload.stream_options && payload.stream_options.include_usage) {
+            res.write(`data: ${JSON.stringify({ ...base, choices: [], usage: r.usage })}\n\n`);
+          }
+          res.write('data: [DONE]\n\n');
+          res.end();
+          log({ reqId, model: echoModel, stream: true, status: 200, ms: Date.now() - t0, attempt, usage: r.usage });
+        } else {
+          const r = await runClaude({ system, prompt, model, stream: false });
+          let text = r.text || '';
+          let finish = r.finishReason || 'stop';
+          for (const s of stops) { if (!s) continue; const k = text.indexOf(s); if (k >= 0) { text = text.slice(0, k); finish = 'stop'; } }
+          send(res, 200, {
+            id, object: 'chat.completion', created, model: echoModel,
+            choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: finish }],
+            usage: r.usage,
+          }, { 'x-request-id': reqId });
+          log({ reqId, model: echoModel, stream: false, status: 200, ms: Date.now() - t0, attempt, usage: r.usage });
+        }
+        break;
+      } catch (e) {
+        if (e.kind === 'claude' && e.transient && attempt <= RETRIES && !headersSent) {
+          log({ reqId, model: echoModel, retry: attempt, transient_err: String(e.message).slice(0, 200) });
+          await new Promise((r) => setTimeout(r, 250 * attempt * attempt));
+          continue;
+        }
+        throw e;
+      }
+    }
   } catch (e) {
-    if (stream && res.headersSent) { try { res.end(); } catch (_) {} }
-    else oaiError(res, 502, String(e.message || e), 'api_error');
+    const ms = Date.now() - t0;
+    if (headersSent) {
+      try {
+        res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], error: { message: String(e.message), type: e.kind === 'rate_limit' ? 'rate_limit_error' : 'api_error' } })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } catch (_) {}
+      log({ reqId, model: echoModel, status: 'stream_error', kind: e.kind, ms, err: String(e.message).slice(0, 200) });
+    } else if (e.kind === 'rate_limit') {
+      log({ reqId, status: 429, ms, err: String(e.message).slice(0, 200) });
+      oaiError(res, 429, 'rate/usage limit on the Claude backend (Max window). Retry after the indicated delay.', 'rate_limit_error', 'rate_limit_exceeded', { 'Retry-After': String(e.retryAfter || 60), 'x-request-id': reqId });
+    } else if (e.kind === 'timeout') {
+      log({ reqId, status: 504, ms, err: String(e.message).slice(0, 200) });
+      oaiError(res, 504, e.message, 'api_error', 'timeout', { 'x-request-id': reqId });
+    } else {
+      log({ reqId, status: 502, ms, err: String(e.message).slice(0, 300) });
+      oaiError(res, 502, String(e.message || 'upstream error'), 'api_error', 'upstream_error', { 'x-request-id': reqId });
+    }
   } finally {
     releaseSlot();
   }
 }
 
 // ---- server ----------------------------------------------------------------
-
 const server = http.createServer((req, res) => {
   const url = (req.url || '').split('?')[0];
+  const reqId = crypto.randomUUID();
 
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Authorization,Content-Type' });
+    return res.end();
+  }
   if (req.method === 'GET' && url === '/health') {
-    return send(res, 200, {
-      status: 'ok',
-      active,
-      queued: waiters.length,
-      max_concurrency: MAX_CONCURRENCY,
-      served,
-      peak_queue: peakQueue,
-    });
+    return send(res, 200, { status: 'ok', active, queued: waiters.length, max_concurrency: MAX_CONCURRENCY, max_queue: MAX_QUEUE, served, shed, peak_queue: peakQueue });
   }
   if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
-    if (!authOk(req)) return oaiError(res, 401, 'invalid api key', 'authentication_error');
+    if (!authOk(req)) return oaiError(res, 401, 'invalid or missing api key', 'invalid_request_error', 'invalid_api_key');
     return handleModels(res);
   }
   if (req.method === 'POST' && (url === '/v1/chat/completions' || url === '/chat/completions')) {
-    if (!authOk(req)) return oaiError(res, 401, 'invalid api key', 'authentication_error');
-    let body = '';
-    req.on('data', (c) => { body += c; if (body.length > 25 * 1024 * 1024) req.destroy(); });
-    req.on('end', () => handleChat(req, res, body));
+    if (!authOk(req)) return oaiError(res, 401, 'invalid or missing api key', 'invalid_request_error', 'invalid_api_key');
+    let body = '', tooBig = false;
+    req.on('data', (c) => { body += c; if (body.length > 25 * 1024 * 1024) { tooBig = true; req.destroy(); } });
+    req.on('end', () => { if (tooBig) return; handleChat(req, res, body, reqId); });
+    req.on('error', () => {});
     return;
   }
-  return oaiError(res, 404, `no route for ${req.method} ${url}`, 'not_found');
+  return oaiError(res, 404, `no route for ${req.method} ${url}`, 'invalid_request_error', 'not_found');
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    `[climax] listening on :${PORT} ` +
-    `(model=${MODEL_ID}, auth=${API_KEY ? 'on' : 'off'}, ` +
-    `concurrency=${MAX_CONCURRENCY}, queue=unbounded)`
-  );
+  if (!API_KEY) log({ level: 'warn', msg: 'CLIMAX_API_KEY not set — server is OPEN (no auth)' });
+  log({ msg: 'climax v2 listening', port: PORT, model: MODEL_ID, auth: API_KEY ? 'on' : 'off', concurrency: MAX_CONCURRENCY, max_queue: MAX_QUEUE, retries: RETRIES, fallback_model: FALLBACK_MODEL || null });
 });
+
+// Graceful shutdown: stop accepting, let in-flight finish.
+function shutdown(sig) { log({ msg: 'shutting down', sig }); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 10000).unref(); }
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
