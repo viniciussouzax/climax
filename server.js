@@ -131,7 +131,7 @@ function sumInput(u) {
 function runClaude({ system, prompt, model, stream, onDelta }) {
   return new Promise((resolve, reject) => {
     let sysFile = null;
-    const args = ['-p', '--max-turns', '1', '--allowedTools', ''];
+    const args = ['-p', '--max-turns', '1', '--allowedTools', '', '--no-session-persistence'];
     if (stream) args.push('--output-format', 'stream-json', '--include-partial-messages', '--verbose');
     else args.push('--output-format', 'json');
     if (model) args.push('--model', model);
