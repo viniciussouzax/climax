@@ -282,7 +282,9 @@ async function handleChat(req, res, body, reqId) {
   const { system, prompt } = buildPrompt(messages);
   const model = mapModel(payload.model);
   const echoModel = payload.model || MODEL_ID;
-  log({ reqId, dbg: 'req', model: echoModel, msgs: messages.length, roles: messages.map((m) => m.role).join(','), sysLen: system.length, tools: Array.isArray(payload.tools) ? payload.tools.length : 0, tool_choice: payload.tool_choice || null, stream: payload.stream === true, sysHead: DEBUG_REQ ? system.slice(0, 1500) : system.slice(0, 500) });
+  // Request shape is always logged (no PII). The system-prompt head (which can
+  // contain contact PII) is logged ONLY when CLIMAX_DEBUG_REQ=1.
+  log({ reqId, dbg: 'req', model: echoModel, msgs: messages.length, roles: messages.map((m) => m.role).join(','), sysLen: system.length, tools: Array.isArray(payload.tools) ? payload.tools.length : 0, tool_choice: payload.tool_choice || null, stream: payload.stream === true, ...(DEBUG_REQ ? { sysHead: system.slice(0, 1500) } : {}) });
   const id = 'chatcmpl-' + crypto.randomUUID();
   const created = Math.floor(Date.now() / 1000);
   const stream = payload.stream === true;
