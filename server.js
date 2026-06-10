@@ -32,6 +32,11 @@ const TIMEOUT_MS = parseInt(process.env.CLIMAX_TIMEOUT_MS || '180000', 10);
 const MAX_CONCURRENCY = parseInt(process.env.CLIMAX_MAX_CONCURRENCY || '12', 10);
 const MAX_QUEUE = parseInt(process.env.CLIMAX_MAX_QUEUE || '200', 10);
 const RETRIES = parseInt(process.env.CLIMAX_RETRIES || '2', 10);
+// Max agentic turns for the underlying claude. Tools stay DENIED (--allowedTools
+// ''), so claude can never execute anything; >1 only gives it room to give up on
+// a (denied) tool attempt and answer in text instead of failing error_max_turns.
+const MAX_TURNS = parseInt(process.env.CLIMAX_MAX_TURNS || '8', 10);
+const DEBUG_REQ = process.env.CLIMAX_DEBUG_REQ === '1';
 const DEFAULT_MODEL = process.env.CLIMAX_DEFAULT_MODEL || ''; // '' = let the CLI pick its default
 const FALLBACK_MODEL = process.env.CLIMAX_FALLBACK_MODEL || ''; // optional auto-fallback on overload
 
@@ -141,7 +146,7 @@ function sumInput(u) {
 function runClaude({ system, prompt, model, stream, onDelta }) {
   return new Promise((resolve, reject) => {
     let sysFile = null;
-    const args = ['-p', '--max-turns', '1', '--allowedTools', '', '--no-session-persistence'];
+    const args = ['-p', '--max-turns', String(MAX_TURNS), '--allowedTools', '', '--no-session-persistence'];
     if (stream) args.push('--output-format', 'stream-json', '--include-partial-messages', '--verbose');
     else args.push('--output-format', 'json');
     if (model) args.push('--model', model);
@@ -277,6 +282,7 @@ async function handleChat(req, res, body, reqId) {
   const { system, prompt } = buildPrompt(messages);
   const model = mapModel(payload.model);
   const echoModel = payload.model || MODEL_ID;
+  log({ reqId, dbg: 'req', model: echoModel, msgs: messages.length, roles: messages.map((m) => m.role).join(','), sysLen: system.length, tools: Array.isArray(payload.tools) ? payload.tools.length : 0, tool_choice: payload.tool_choice || null, stream: payload.stream === true, sysHead: DEBUG_REQ ? system.slice(0, 1500) : system.slice(0, 500) });
   const id = 'chatcmpl-' + crypto.randomUUID();
   const created = Math.floor(Date.now() / 1000);
   const stream = payload.stream === true;
