@@ -221,9 +221,11 @@ function runClaude({ system, prompt, model, stream, onDelta }) {
 
       if (rateLimited && (rateLimited.hard || code !== 0)) return finish(reject, new RateLimitError('claude rate/usage limit', rateLimited.retryAfter));
       if (code !== 0) {
-        if (isRateLimitText(err)) return finish(reject, new RateLimitError('claude rate/usage limit', (rateLimited && rateLimited.retryAfter) || 60));
-        const transient = !err.trim() || /(5\d\d|overloaded|timeout|econnreset|temporar|refresh|network|socket)/i.test(err);
-        return finish(reject, new ClaudeError(`claude exited ${code}: ${(err.trim() || '(empty stderr)').slice(0, 400)}`, transient));
+        // The CLI often reports the real error on STDOUT (json envelope), not stderr.
+        const detail = err.trim() || resultErr || (out.trim() ? 'stdout: ' + out.trim().slice(0, 300) : '(no output)');
+        if (isRateLimitText(detail)) return finish(reject, new RateLimitError('claude rate/usage limit', (rateLimited && rateLimited.retryAfter) || 60));
+        const transient = !err.trim() || /(5\d\d|overloaded|timeout|econnreset|temporar|refresh|network|socket)/i.test(detail);
+        return finish(reject, new ClaudeError(`claude exited ${code}: ${String(detail).slice(0, 400)}`, transient));
       }
       if (resultErr) return finish(reject, new ClaudeError(resultErr.slice(0, 400), false));
       finish(resolve, { text, usage, finishReason });
@@ -308,7 +310,7 @@ async function handleChat(req, res, body, reqId) {
       } catch (e) {
         if (e.kind === 'claude' && e.transient && attempt <= RETRIES && !headersSent) {
           log({ reqId, model: echoModel, retry: attempt, transient_err: String(e.message).slice(0, 200) });
-          await new Promise((r) => setTimeout(r, 250 * attempt * attempt));
+          await new Promise((r) => setTimeout(r, 1000 * attempt * attempt));
           continue;
         }
         throw e;
