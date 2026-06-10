@@ -35,6 +35,16 @@ const RETRIES = parseInt(process.env.CLIMAX_RETRIES || '2', 10);
 const DEFAULT_MODEL = process.env.CLIMAX_DEFAULT_MODEL || ''; // '' = let the CLI pick its default
 const FALLBACK_MODEL = process.env.CLIMAX_FALLBACK_MODEL || ''; // optional auto-fallback on overload
 
+// Always-on system instruction that keeps Claude a PLAIN TEXT LLM. Without it,
+// the underlying Claude Code CLI may try to call ITS OWN built-in tools
+// (WebSearch, Bash, ...) on prompts that suggest an action, which with
+// --max-turns 1 fails with `error_max_turns` and breaks the response. Tool /
+// agent orchestration belongs to the CALLER (e.g. the evo-ai agent), not to
+// the LLM. Set CLIMAX_SYSTEM_SUFFIX="" to disable.
+const SYSTEM_SUFFIX = process.env.CLIMAX_SYSTEM_SUFFIX !== undefined
+  ? process.env.CLIMAX_SYSTEM_SUFFIX
+  : 'You are a plain text chat assistant. You have NO tools and cannot browse the web, run code, read files, or take any action. Never attempt to call or use any tool — always answer the user directly in plain text with what you already know.';
+
 // ---- concurrency pool + BOUNDED FIFO queue ---------------------------------
 let active = 0, served = 0, peakQueue = 0, shed = 0;
 const waiters = [];
@@ -136,12 +146,16 @@ function runClaude({ system, prompt, model, stream, onDelta }) {
     else args.push('--output-format', 'json');
     if (model) args.push('--model', model);
     if (FALLBACK_MODEL) args.push('--fallback-model', FALLBACK_MODEL);
-    if (system) {
+    // Combine the caller's system prompt with the always-on plain-LLM guard.
+    // Passing --system-prompt[-file] also replaces Claude Code's heavy default
+    // (tool-advertising) system prompt.
+    const sys = [system, SYSTEM_SUFFIX].filter(Boolean).join('\n\n');
+    if (sys) {
       try {
         sysFile = path.join(os.tmpdir(), 'climax-sys-' + crypto.randomUUID() + '.txt');
-        fs.writeFileSync(sysFile, system);
+        fs.writeFileSync(sysFile, sys);
         args.push('--system-prompt-file', sysFile);
-      } catch (_) { sysFile = null; args.push('--system-prompt', system); }
+      } catch (_) { sysFile = null; args.push('--system-prompt', sys); }
     }
 
     const childEnv = { ...process.env };
